@@ -1,0 +1,241 @@
+<#
+.SYNOPSIS
+Standalone script to run nxql queries
+
+.DESCRIPTION
+Script imports nxql queries from csv file, invokes an API call & downloads the output files to folder mentioned in config file.
+
+How to use ?
+
+ Update config file as per the environment, 
+    - use generate encrypted password script (attached with this script) to enrypt your nxql password. 
+    - update the username & encrypted password in config file
+    - verify the port number (cloud - 443, On-Prem 1671)
+    - ensure local folder and network share data is updated
+
+Pre-Requiste 
+
+Config file(.xml), csv file containing nxql queries and the script(.ps1) you're reading now should be placed together in one folder always. 
+
+Modified by : MSP - Enhanced Support team
+
+
+Version
+  - 1.6 - enabled logs
+  - 1.5 - modified output format
+  - 1.4 - modified output format
+  - 1.3 - nxql query is added to column of csv file
+  - 1.2 - nxql queries are fetched from csv file
+  - 1.1 - password in config file is encrypted
+  - 1.0 - Initial release 
+   
+#>
+
+
+Function Invoke-Nxql {
+	Param(
+		[Parameter(Mandatory=$true)]
+		[string]$ServerName,
+		[Parameter(Mandatory=$true)]
+		[string]$UserName,
+		[Parameter(Mandatory=$true)]
+		[string]$UserPassword,
+		[Parameter(Mandatory=$true)]
+		[string]$Query,
+		[Parameter(Mandatory=$false)]
+		[int]$PortNumber,
+		[Parameter(Mandatory=$false)]
+		[string]$OuputFormat = "csv",
+		[Parameter(Mandatory=$false)]
+		[string[]]$Platforms = "windows",
+		[Parameter(Mandatory=$false)]
+		[string]$FirstParameter,
+		[Parameter(Mandatory=$false)]
+		[string]$SecondParameter
+	)
+	$PlaformsString = ""
+	Foreach ($platform in $Platforms) {
+	    $PlaformsString += "&platform={0}" -f $platform
+	}
+	$EncodedNxqlQuery = [System.Web.HttpUtility]::UrlEncode($Query)
+	$Url = "https://{0}:{1}/2/query?query={2}&format={3}{4}" -f $ServerName,$PortNumber,$EncodedNxqlQuery,$OuputFormat,$PlaformsString
+	if ($FirstParameter) { 
+		$EncodedFirstParameter = [System.Web.HttpUtility]::UrlEncode($FirstParameter)
+		$Url = "{0}&p1={1}" -f $Url,$EncodedFirstParameter
+	}
+	if ($SecondParameter) { 
+		$EncodedSecondParameter = [System.Web.HttpUtility]::UrlEncode($SecondParameter)
+		$Url = "{0}&p2={1}" -f $Url,$EncodedSecondParameter
+	}
+	echo $Url
+    Write-Host $Url
+	try
+    {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls11
+	    [Net.ServicePointManager]::ServerCertificateValidationCallback = {$true} 
+	    $webclient = New-Object system.net.webclient
+	    $webclient.Credentials = New-Object System.Net.NetworkCredential($UserName, $UserPassword)
+        $webclient.DownloadString($Url)
+    }
+    catch
+    {
+        Write-Host $Error[0].Exception.Message
+    }
+}; Set-Alias inxql Invoke-Nxql  
+
+function Test-IsUNCPath ([string]$Path) {
+    return ([System.uri]$Path).IsUnc
+}
+
+#Main
+
+remove-variable * -ea 0
+
+Add-Type -AssemblyName System.Web
+
+$ScriptPath = $MyInvocation.MyCommand.Path
+
+New-Item -Path (Split-Path -Path $ScriptPath -Parent) -Name 'logs.txt' -ItemType File -Force
+
+$LOGFILE = Join-Path -Path (Split-Path -Path $ScriptPath -Parent) -ChildPath "logs.txt"
+
+if (Test-Path $LOGFILE) { Remove-Item $LOGFILE -Force }
+
+Start-Transcript -Path $LOGFILE
+
+#$PlatformType = @("Windows", "mac_os")
+
+$PlatformType = @("Windows")
+
+
+#ReadXML
+
+$appConfigFile = Join-Path -Path (Split-Path -Path $ScriptPath -Parent) -ChildPath "config.xml"
+
+$csvfilepath = Join-Path -Path (Split-Path -Path $ScriptPath -Parent) -ChildPath "Nxql_Queries.csv"
+
+$csvobj = Import-csv -Path $csvfilepath
+
+Write-Host $ScriptPath, $appConfigFile
+
+$Config = ([xml](Get-Content $appConfigFile)).root
+
+$NXQLuser = $Config.username
+
+$portal = $Config.portal_fqdn
+
+$portnumber = $Config.port_number
+
+$timestamp = (Get-Date).toString("dd_MMM_yyyy")
+
+$ResultsFilePath = Join-Path -Path $Config.outputcsvPath -ChildPath $timestamp
+
+#decrypt key
+
+[Byte[]] $key = (1..16)
+
+#decrypt password using above key (secure string)
+
+$securPasword = $config.password | ConvertTo-SecureString -Key $key 
+
+#convert back to plain text from secure string
+
+$decrptedPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securPasword))
+
+$web = New-Object system.net.webclient
+
+$web.Credentials = New-Object System.Net.NetworkCredential($NXQLuser, $securPasword)
+ 
+# ask portal for list of engines:
+$baseUrl = "https://Generic-Portal-Site/"
+$result = $web.downloadString($baseUrl)
+$engineList = $result | ConvertFrom-Json
+ 
+# use the addresses of active engines only:
+$Engines = $engineList | ?{$_.status -eq "CONNECTED"}
+
+
+if (Test-Path $ResultsFilePath) { Remove-Item -Path $ResultsFilePath -Force -Recurse
+ New-Item -path $ResultsFilePath -ItemType Directory}
+else {New-Item -path $ResultsFilePath -ItemType Directory}
+
+#$dateToday = Get-Date
+
+# start the timer:
+$t0 = [System.Diagnostics.Stopwatch]::StartNew()
+
+
+foreach ($Platform in $PlatformType) {
+    foreach ($obj in $csvobj) {
+
+        
+        $OutputFilePath = Join-Path -Path $ResultsFilePath -ChildPath "Nexthink_$($obj.Name)$($platform).csv"
+        $OutputFileEnginePath = Join-Path -Path $ResultsFilePath -ChildPath "tempEngine.csv"
+        foreach($engine in $Engines)
+        {
+
+            Write-Host "Processing Query: $($obj.Query) for $($engine.address)"
+
+            if (Test-Path $OutputFileEnginePath) { Remove-Item -Path $OutputFileEnginePath -Force -ea SilentlyContinue }
+            
+            Invoke-Nxql -ServerName $($engine.address) -PortNumber $portnumber -UserName $NXQLuser -UserPassword $decrptedPassword -Platforms $Platform -Query $($obj.Query) |Select-Object -Skip 1 | out-file -append $OutputFileEnginePath
+
+            $dateToday = Get-Date
+
+            If (($obj.Query -match 'between') -and ($obj.Query -match '1d')) {
+            
+                echo "$($obj.Name) contains between clause"
+            
+                $dateToday = (get-date).AddDays(-1)
+            
+            }
+
+           <# $Data = Import-Csv $OutputFileEnginePath -Delimiter "`t"
+            $Data | Add-Member -MemberType NoteProperty -Name Engine -Value $engine.Name
+            $Data | Add-Member -MemberType NoteProperty -Name Query -Value $obj.Name
+            $Data | Add-Member -MemberType NoteProperty -Name date -Value $dateToday
+            $Data | Export-csv -Path $OutputFilePath -Delimiter "`t" -Encoding Unicode -NoTypeInformation -Append#>
+            
+            Import-Csv $OutputFileEnginePath -Delimiter "`t" | ForEach-Object {
+                
+                $hash = [ordered]@{Date = $dateToday;Query = $obj.Name}
+                $i = $_
+                $_.psobject.properties |ForEach-Object {$hash.($_.Name) = $i.($_.Name)}
+                              
+                [PSCustomObject]$hash } | Export-csv -Path $OutputFilePath -Delimiter "`t" -Encoding Unicode -NoTypeInformation -Append
+
+            Write-Host "Processing completed - Query: $($obj.Query) for $($engine.address)"
+
+        }
+    }
+}
+
+Remove-Item -Path $OutputFileEnginePath -Force -ea SilentlyContinue
+## ZIP
+Compress-Archive -LiteralPath $ResultsFilePath -DestinationPath $($ResultsFilePath + ".zip")
+Remove-Item $ResultsFilePath -Recurse -Force
+
+## Copy to network path
+
+if (Test-IsUNCPath -Path $Config.networkShare) {
+
+     
+    
+    if (Test-Path -Path $Config.networkShare) {
+        Copy-Item -Path $($ResultsFilePath + ".zip") -Destination $Config.networkShare -Force 
+
+         Write-Host "$($ResultsFilePath + ".zip") is copied to $Config.networkShare"
+
+    } else {
+        throw "Network path not reachable"
+
+
+    }
+} else {
+    throw "Network path not a UNC path"
+}
+
+
+# show runtime:
+$t0.Stop()
+write-host "total runtime:" $t0.Elapsed.TotalSeconds
